@@ -1,6 +1,4 @@
--- ----------------------------------------
 -- Table: public.product_lines
--- ----------------------------------------
 CREATE TABLE IF NOT EXISTS public.product_lines
 (
     id text COLLATE pg_catalog."default" NOT NULL,
@@ -18,18 +16,15 @@ CREATE TABLE IF NOT EXISTS public.product_lines
     compliance_resource_id text COLLATE pg_catalog."default",
     attachments_raw text COLLATE pg_catalog."default",
     created_at timestamp with time zone NOT NULL DEFAULT now(),
+    updated_at timestamp with time zone DEFAULT now(),
+    created_by bigint,
+    updated_by bigint,
     CONSTRAINT product_lines_pkey PRIMARY KEY (id),
     CONSTRAINT product_lines_name_uk UNIQUE (name)
 );
 
-ALTER TABLE IF EXISTS public.product_lines
-    OWNER to "administrationSTS";
-
--- ----------------------------------------
 -- Table: public.products
--- ----------------------------------------
--- Ensure the sequence exists or is correctly referenced
-CREATE SEQUENCE IF NOT EXISTS products_id_seq START WITH 1 INCREMENT BY 1;
+CREATE SEQUENCE IF NOT EXISTS products_id_seq;
 
 CREATE TABLE IF NOT EXISTS public.products
 (
@@ -48,7 +43,7 @@ CREATE TABLE IF NOT EXISTS public.products
     capacity text COLLATE pg_catalog."default",
     our_advantages text COLLATE pg_catalog."default",
     gmdc_pct numeric(5,2),
-    product_pictures bytea,
+    product_pictures bytea, 
     product_line_id text COLLATE pg_catalog."default",
     customers_in_production text COLLATE pg_catalog."default",
     customer_in_development text COLLATE pg_catalog."default",
@@ -57,8 +52,11 @@ CREATE TABLE IF NOT EXISTS public.products
     prod_if_customer_in_china boolean,
     costing_data text COLLATE pg_catalog."default",
     created_at timestamp with time zone NOT NULL DEFAULT now(),
-    CONSTRAINT products_pkey PRIMARY KEY (id)
+    updated_at timestamp with time zone DEFAULT now(),
+    created_by bigint,
+    updated_by bigint,
+    CONSTRAINT products_pkey PRIMARY KEY (id),
+    CONSTRAINT fk_product_line FOREIGN KEY (product_line_id)
+        REFERENCES public.product_lines (id)
+        ON UPDATE CASCADE ON DELETE SET NULL
 );
-
-ALTER TABLE IF EXISTS public.products
-    OWNER to "administrationSTS";

@@ -1,208 +1,259 @@
-const db = require('../config/db'); // PostgreSQL connection pool
+const pool = require('../config/db');
+// NEW: Import the file controller for file deletion logic
+const { deleteFile } = require('./fileController'); 
 
-// Allowed collections for universal CRUD endpoints
-const allowedCollections = ['product_lines', 'products', 'users', 'audit_logs'];
-
-/**
- * Executes a dual-write: first to the main table, then to the audit_logs table.
- * @param {string} action - CREATE, UPDATE, DELETE
- * @param {string} table_name - The table being modified
- * @param {string} document_id - The ID of the record modified
- * @param {number} user_id - The ID of the user performing the action
- * @param {string} user_email - The email of the user
- * @param {object} details - Optional details about the change
- */
-const logAction = async (action, table_name, document_id, user_id, user_email, details = {}) => {
+// --- AUDITING FUNCTION (Centralized logging) ---
+exports.logAction = async (action, table_name, document_id, user_id, user_name, details = {}) => {
     try {
-        const query = `
-            INSERT INTO public.audit_logs (action, table_name, document_id, user_id, user_email, details)
-            VALUES ($1, $2, $3, $4, $5, $6)
-        `;
-        await db.query(query, [
-            action, 
-            table_name, 
-            document_id, 
-            user_id, 
-            user_email, 
-            JSON.stringify(details)
-        ]);
+        await pool.query(
+            'INSERT INTO audit_logs (action, table_name, document_id, user_id, user_name, details) VALUES ($1, $2, $3, $4, $5, $6)',
+            [action, table_name, document_id, user_id, user_name, details]
+        );
     } catch (error) {
-        console.error("CRITICAL: Failed to write audit log:", error.message);
+        console.error(`CRITICAL: Failed to write audit log for ${action} on ${table_name}/${document_id}. Error:`, error);
+        // Do not throw, as a failed log should not crash the main operation
     }
 };
 
-// --- CRUD Functions ---
+const { logAction } = exports; // Reference for internal use
 
-const getItems = (req, res) => {
-    const collectionName = req.params.collectionName;
+// --- DYNAMIC CRUD OPERATIONS (using tableName from server.js routes) ---
 
-    if (!allowedCollections.includes(collectionName)) {
-        return res.status(400).json({ error: 'Invalid collection name.' });
+// GET All Items
+exports.getAllItems = (tableName) => async (req, res) => {
+// ... (No change) ...
+    try {
+        let orderByClause = 'ORDER BY id ASC';
+        let whereClause = '';
+        const queryParams = [];
+
+        if (tableName === 'audit_logs') {
+            // FIX APPLIED HERE: Filter out LOGIN and LOGOUT actions at the database level
+            orderByClause = 'ORDER BY logged_at DESC';
+            whereClause = "WHERE action NOT IN ('LOGIN', 'LOGOUT')";
+        } else if (tableName === 'users' || tableName === 'product_lines' || tableName === 'products') {
+            orderByClause = 'ORDER BY created_at DESC';
+        }
+
+        const result = await pool.query(`SELECT * FROM ${tableName} ${whereClause} ${orderByClause}`, queryParams);
+        res.status(200).json(result.rows);
+    } catch (error) {
+        console.error(`Error fetching ${tableName}:`, error);
+        res.status(500).json({ message: `Error fetching data for ${tableName}.` });
     }
+};
 
-    // Sort audit logs by date descending
-    const orderBy = collectionName === 'audit_logs' ? 'ORDER BY logged_at DESC' : '';
+// CREATE Item
+exports.createItem = (tableName) => async (req, res) => {
+    // Data from req.body (non-file fields) AND req.files (file paths)
+    const data = req.body; 
+    const userId = req.user.id;
+    const userName = req.user.displayName;
     
-    db.query(`SELECT * FROM public.${collectionName} ${orderBy}`)
-        .then(result => {
-            res.json(result.rows);
-        })
-        .catch(error => {
-            console.error(`Error fetching ${collectionName}:`, error.message);
-            res.status(500).json({ error: `Failed to fetch ${collectionName} data.` });
-        });
-};
-
-const createItem = async (req, res) => {
-    const collectionName = req.params.collectionName;
-
-    if (!allowedCollections.includes(collectionName) || collectionName === 'audit_logs' || collectionName === 'users') {
-        return res.status(400).json({ error: 'Cannot create items on this collection via this route.' });
+    // 1. Process uploaded files from Multer and add path to data payload
+    if (req.files) {
+        // Check for product_pictures (Products)
+        if (req.files.product_pictures && req.files.product_pictures[0]) {
+            // Store the relative URL to access the file later: 'uploads/filename.ext'
+            data.product_pictures = `uploads/${req.files.product_pictures[0].filename}`;
+        }
+        // Check for attachments_raw (Product Lines)
+        if (req.files.attachments_raw && req.files.attachments_raw[0]) {
+            data.attachments_raw = `uploads/${req.files.attachments_raw[0].filename}`;
+        }
     }
+    
+    const columns = Object.keys(data).join(', ');
+    const values = Object.values(data);
+    const placeholders = values.map((_, i) => `$${i + 1}`).join(', ');
+    
+    // Add columns for user and date tracking
+    const userColumns = 'created_by, updated_by';
+    const userPlaceholders = `$${values.length + 1}, $${values.length + 2}`;
+    
+    // Store path for potential cleanup
+    const fileToDeleteOnRollback = data.product_pictures || data.attachments_raw;
 
-    const client = await db.connect();
+    const client = await pool.connect();
     try {
         await client.query('BEGIN'); // Start transaction
 
-        const fields = Object.keys(req.body);
-        const values = Object.values(req.body);
+        // 2. Insert into main table
+        const insertQuery = `INSERT INTO ${tableName} (${columns}, ${userColumns}) VALUES (${placeholders}, ${userPlaceholders}) RETURNING *`;
         
-        // Add created_by, updated_by, and created_at/updated_at fields
-        fields.push('created_by', 'updated_by');
-        values.push(req.user.id, req.user.id); 
-
-        const placeholderIndices = fields.map((f, i) => `$${i + 1}`).join(', ');
-        const fieldNames = fields.join(', ');
-
-        const insertQuery = `
-            INSERT INTO public.${collectionName} (${fieldNames})
-            VALUES (${placeholderIndices})
-            RETURNING *;
-        `;
-
-        const result = await client.query(insertQuery, values);
+        const result = await client.query(insertQuery, [...values, userId, userId]);
         const newItem = result.rows[0];
-        
-        // Log the action (Dual-Write)
-        await logAction('CREATE', collectionName, newItem.id, req.user.id, req.user.email, req.body);
 
-        await client.query('COMMIT'); // End transaction
+        // 3. Audit Log (DUAL-WRITE)
+        await logAction('CREATE', tableName, newItem.id, userId, userName, data);
+
+        await client.query('COMMIT'); // Commit transaction
         res.status(201).json(newItem);
 
     } catch (error) {
         await client.query('ROLLBACK'); // Rollback on error
-        console.error(`Error creating item in ${collectionName}:`, error.message);
-        res.status(500).json({ error: `Failed to create new ${collectionName} item. ${error.message}` });
+        console.error(`Error creating ${tableName}:`, error);
+        
+        // CRITICAL: Cleanup uploaded files if transaction fails
+        if (fileToDeleteOnRollback) {
+            deleteFile(fileToDeleteOnRollback);
+        }
+
+        // Handle common PostgreSQL errors (e.g., unique constraint violation)
+        if (error.code === '23505') {
+            return res.status(409).json({ message: `A record with this unique name/ID already exists.` });
+        }
+        res.status(500).json({ message: `Error creating new ${tableName}.` });
     } finally {
         client.release();
     }
 };
 
-const updateItem = async (req, res) => {
-    const collectionName = req.params.collectionName;
-    const id = req.params.id;
+// UPDATE Item
+exports.updateItem = (tableName) => async (req, res) => {
+    const { id } = req.params;
+    const data = req.body; // Contains non-file fields and file path if uploaded
+    const userId = req.user.id;
+    const userName = req.user.displayName;
+    
+    // Determine the specific file field for the current table
+    const fileField = tableName === 'products' ? 'product_pictures' : 
+                      tableName === 'product_lines' ? 'attachments_raw' : null;
 
-    if (!allowedCollections.includes(collectionName) || collectionName === 'audit_logs' || collectionName === 'users') {
-        return res.status(400).json({ error: 'Cannot update this collection via this route.' });
+    // 1. Process uploaded files from Multer and add path to data payload
+    if (req.files && fileField) {
+        if (req.files[fileField] && req.files[fileField][0]) {
+            data[fileField] = `uploads/${req.files[fileField][0].filename}`;
+        }
     }
 
-    const client = await db.connect();
+    // Filter out server-managed columns. 'data' now contains new file path if uploaded.
+    const allowedKeys = Object.keys(data).filter(key => 
+        !['id', 'created_at', 'created_by', 'updated_at', 'updated_by'].includes(key)
+    );
+
+    if (allowedKeys.length === 0 && !req.files) {
+        return res.status(400).json({ message: 'No valid fields or new file provided for update.' });
+    }
+    
+    const setClauses = allowedKeys
+        .map((key, i) => `${key} = $${i + 1}`)
+        .join(', ');
+
+    const values = allowedKeys.map(key => data[key]);
+    
+    // Append updated_at and updated_by to the end of SET clauses
+    // userId is $N+1, id is $N+2 (where N is values.length)
+    const totalValues = [...values, userId, id]; 
+    const setClauseFinal = (setClauses ? `${setClauses}, ` : '') + `updated_at = NOW(), updated_by = $${values.length + 1}`;
+    
+    let oldFilePath = null; // Store old file path for cleanup after successful update
+    let newFilePath = data[fileField]; // Path of the file uploaded NOW
+    
+    const client = await pool.connect();
     try {
         await client.query('BEGIN'); // Start transaction
 
-        // 1. Prepare Update Query
-        const updates = req.body;
-        const setClauses = [];
-        const values = [];
-        let index = 1;
-
-        for (const key in updates) {
-            setClauses.push(`${key} = $${index}`);
-            values.push(updates[key]);
-            index++;
+        // 2. Get the old data for the audit log AND old file path
+        // FIX: Only select the specific file field for this table
+        const selectFields = fileField ? `*, ${fileField}` : '*';
+        const oldDataResult = await pool.query(`SELECT ${selectFields} FROM ${tableName} WHERE id = $1`, [id]);
+        const oldData = oldDataResult.rows[0] || {};
+        
+        // If a NEW file was uploaded (newFilePath is set)
+        if (newFilePath && fileField) {
+            oldFilePath = oldData[fileField];
         }
 
-        // Add user and timestamp tracking
-        setClauses.push(`updated_by = $${index}`, `updated_at = NOW()`);
-        values.push(req.user.id);
-        index++;
-        
-        values.push(id); // ID is the last parameter ($index)
+        // 3. Update main table
+        const updateQuery = `UPDATE ${tableName} SET ${setClauseFinal} WHERE id = $${values.length + 2} RETURNING *`;
+        const result = await pool.query(updateQuery, totalValues);
 
-        const updateQuery = `
-            UPDATE public.${collectionName}
-            SET ${setClauses.join(', ')}
-            WHERE id = $${index}
-            RETURNING *;
-        `;
-
-        const result = await client.query(updateQuery, values);
-        
         if (result.rowCount === 0) {
             await client.query('ROLLBACK');
-            return res.status(404).json({ error: 'Item not found.' });
+            return res.status(404).json({ message: `${tableName} with ID ${id} not found.` });
         }
         
-        const updatedItem = result.rows[0];
+        // 4. FILE CLEANUP (Success): Delete the old file if a new one was successfully saved to DB
+        if (oldFilePath && newFilePath) {
+            deleteFile(oldFilePath);
+        }
 
-        // 2. Log the action (Dual-Write)
-        await logAction('UPDATE', collectionName, id, req.user.id, req.user.email, updates);
+        // 5. Audit Log (DUAL-WRITE)
+        await logAction('UPDATE', tableName, id, userId, userName, { oldData, newData: data });
 
-        await client.query('COMMIT'); // End transaction
-        res.status(200).json(updatedItem);
+        await client.query('COMMIT'); // Commit transaction
+        res.status(200).json(result.rows[0]);
 
     } catch (error) {
         await client.query('ROLLBACK'); // Rollback on error
-        console.error(`Error updating item in ${collectionName}:`, error.message);
-        res.status(500).json({ error: `Failed to update ${collectionName} item. ${error.message}` });
+        console.error(`Error updating ${tableName}:`, error);
+        
+        // CRITICAL: Cleanup the NEWLY uploaded file if the database update failed
+        if (newFilePath) {
+            deleteFile(newFilePath);
+        }
+
+        res.status(500).json({ message: `Error updating ${tableName}.` });
     } finally {
         client.release();
     }
 };
 
-const deleteItem = async (req, res) => {
-    const collectionName = req.params.collectionName;
-    const id = req.params.id;
+// DELETE Item
+exports.deleteItem = (tableName) => async (req, res) => {
+    const { id } = req.params;
+    const userId = req.user.id;
+    const userName = req.user.displayName;
 
-    if (!allowedCollections.includes(collectionName) || collectionName === 'audit_logs' || collectionName === 'users') {
-        return res.status(400).json({ error: 'Cannot delete this collection via this route.' });
-    }
-
-    const client = await db.connect();
+    // Determine the specific file field for the current table
+    const fileField = tableName === 'products' ? 'product_pictures' : 
+                      tableName === 'product_lines' ? 'attachments_raw' : null;
+    
+    const client = await pool.connect();
+    let fileToDelete = null; 
     try {
         await client.query('BEGIN'); // Start transaction
 
-        const deleteQuery = `
-            DELETE FROM public.${collectionName}
-            WHERE id = $1;
-        `;
-
-        const result = await client.query(deleteQuery, [id]);
-
-        if (result.rowCount === 0) {
-            await client.query('ROLLBACK');
-            return res.status(404).json({ error: 'Item not found for deletion.' });
+        // 1. Get the record's file path before deletion
+        let selectQuery = `SELECT * FROM ${tableName} WHERE id = $1`;
+        
+        // FIX: Conditionally select only the relevant file field if it exists
+        if (fileField) {
+            selectQuery = `SELECT ${fileField} FROM ${tableName} WHERE id = $1`;
         }
         
-        // Log the action (Dual-Write)
-        await logAction('DELETE', collectionName, id, req.user.id, req.user.email, { message: 'Record deleted.' });
+        const oldDataResult = await pool.query(selectQuery, [id]);
+        const oldData = oldDataResult.rows[0];
 
-        await client.query('COMMIT'); // End transaction
+        if (oldData && fileField) {
+            fileToDelete = oldData[fileField]; // Use the determined file field
+        }
+
+        // 2. Delete from main table
+        const result = await pool.query(`DELETE FROM ${tableName} WHERE id = $1`, [id]);
+        
+        if (result.rowCount === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ message: `${tableName} with ID ${id} not found.` });
+        }
+        
+        // 3. FILE CLEANUP (Success)
+        if (fileToDelete) {
+            deleteFile(fileToDelete);
+        }
+
+        // 4. Audit Log (DUAL-WRITE)
+        await logAction('DELETE', tableName, id, userId, userName, { status: 'Record permanently deleted.' });
+
+        await client.query('COMMIT'); // Commit transaction
         res.status(204).send(); // HTTP 204 No Content for successful deletion
 
     } catch (error) {
         await client.query('ROLLBACK'); // Rollback on error
-        console.error(`Error deleting item in ${collectionName}:`, error.message);
-        res.status(500).json({ error: `Failed to delete ${collectionName} item. ${error.message}` });
+        console.error(`Error deleting ${tableName}:`, error);
+        res.status(500).json({ message: `Error deleting ${tableName}.` });
     } finally {
         client.release();
     }
-};
-
-module.exports = {
-    getItems,
-    createItem,
-    updateItem,
-    deleteItem,
-    logAction // Exported for use by the auth controller
 };

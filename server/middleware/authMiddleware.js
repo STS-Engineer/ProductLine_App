@@ -1,32 +1,29 @@
-// Pseudo-code: Assume Firebase Admin SDK is initialized and available via 'admin'
-const admin = require('firebase-admin');
+const jwt = require('jsonwebtoken');
 
-/**
- * Middleware to verify Firebase ID Token and attach user data to the request.
- */
-const authenticate = async (req, res, next) => {
-    // 1. Check for the Authorization header
-    const header = req.headers.authorization;
-    if (!header || !header.startsWith('Bearer ')) {
-        console.warn("Authentication failed: No Bearer token.");
-        return res.status(401).send({ error: 'Unauthorized: No token provided.' });
+const authenticate = (req, res, next) => {
+    // Check for token in Authorization header (Bearer <token>)
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return res.status(401).json({ message: 'Authentication required: No token provided.' });
     }
 
-    const token = header.split(' ')[1];
-    
+    const token = authHeader.split(' ')[1];
+
     try {
-        // 2. Verify the Firebase ID Token
-        const decodedToken = await admin.auth().verifyIdToken(token);
+        // Verify the token using the secret from the .env file
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
         
-        // 3. Attach user info (UID and Name) to the request object
-        req.user = {
-            uid: decodedToken.uid,
-            displayName: decodedToken.name || decodedToken.email || decodedToken.uid,
+        // Attach user info to the request for controllers
+        req.user = { 
+            id: decoded.id, 
+            email: decoded.email,
+            displayName: decoded.displayName 
         };
-        next(); // Proceed to the controller function
-    } catch (error) {
-        console.error("Token verification failed:", error.message);
-        return res.status(401).send({ error: 'Unauthorized: Invalid or expired token.' });
+        next();
+    } catch (err) {
+        console.error("JWT Verification failed:", err);
+        return res.status(401).json({ message: 'Invalid or expired token.' });
     }
 };
 
