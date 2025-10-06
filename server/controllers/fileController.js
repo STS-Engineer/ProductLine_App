@@ -34,8 +34,9 @@ exports.upload = multer({
         }
     }
 }).fields([
-    { name: 'product_pictures', maxCount: 1 },
-    { name: 'attachments_raw', maxCount: 1 }
+    // CRITICAL FIX: Increased maxCount to 10 to allow multiple file uploads
+    { name: 'product_pictures', maxCount: 10 },
+    { name: 'attachments_raw', maxCount: 10 }
 ]);
 
 /**
